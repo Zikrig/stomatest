@@ -29,23 +29,18 @@ ADMIN_CHAT_ID=123456789
 
 `ADMIN_CHAT_ID` — это числовой id чата администратора (можно взять из логов бота или через @userinfobot).
 
-### Сборка Docker‑образа
+### Сборка и запуск через Docker Compose
 
 ```powershell
 cd c:\Users\Ф\Desktop\freelance\stomatest
-docker build -t stomatest-bot .
+docker compose up --build
 ```
 
-### Запуск контейнера
+Бот запустится и подключится к Telegram. Остановить можно командой:
 
 ```powershell
-docker run --rm `
-  --env-file .env `
-  --name stomatest-bot `
-  stomatest-bot
+docker compose down
 ```
-
-Бот запустится и подключится к Telegram. Остановить можно по `Ctrl+C` (если запущен в foreground) или `docker stop stomatest-bot` (если запущен в фоне).
 
 ### Как работает бот
 
