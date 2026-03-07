@@ -352,6 +352,9 @@ def _save_config(data: Dict[str, Any]) -> None:
 def get_welcome_text() -> str:
     data = _load_config()
     t = data.get("welcome_text")
+    # Не показывать команды как приветствие (если админ случайно сохранил /admin или /start)
+    if t and t.strip().startswith("/"):
+        return DEFAULT_WELCOME_TEXT
     return t if t else DEFAULT_WELCOME_TEXT
 
 
@@ -515,6 +518,37 @@ def _admin_send_menu(chat_id: int, text: str = "Админка. Выберите
     bot.send_message(chat_id, text, reply_markup=_admin_main_markup())
 
 
+def _admin_send_welcome_preview(chat_id: int) -> None:
+    """Отправляет текущий вид приветствия (как видят пользователи), без кнопок."""
+    welcome_text = get_welcome_text()
+    photo_file_id = get_welcome_photo()
+    if photo_file_id:
+        caption = welcome_text[:PHOTO_CAPTION_MAX] + ("…" if len(welcome_text) > PHOTO_CAPTION_MAX else "")
+        bot.send_photo(chat_id, photo_file_id, caption=caption, parse_mode="Markdown")
+        if len(welcome_text) > PHOTO_CAPTION_MAX:
+            bot.send_message(chat_id, welcome_text, parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, welcome_text, parse_mode="Markdown")
+
+
+def _admin_send_question_preview(chat_id: int, q_index: int) -> None:
+    """Отправляет текущий вид вопроса (как видят пользователи), без кнопок ответов."""
+    display_text = get_question_display_text(q_index)
+    text = f"Вопрос {q_index + 1} из {len(QUESTIONS)}\n\n{display_text}"
+    photo_file_id = get_question_photo(q_index)
+    if photo_file_id:
+        caption = text[:PHOTO_CAPTION_MAX] + ("…" if len(text) > PHOTO_CAPTION_MAX else "")
+        bot.send_photo(chat_id, photo_file_id, caption=caption)
+        if len(text) > PHOTO_CAPTION_MAX:
+            bot.send_message(chat_id, text)
+    else:
+        bot.send_message(chat_id, text)
+
+
+# Ограничение длины подписи к фото в Telegram (API)
+PHOTO_CAPTION_MAX = 1024
+
+
 @bot.message_handler(func=lambda m: m.from_user and m.from_user.id in admin_states)
 def handle_admin_input(message: types.Message) -> None:
     user_id = message.from_user.id
@@ -526,20 +560,30 @@ def handle_admin_input(message: types.Message) -> None:
         return
     chat_id = message.chat.id
     action = state.get("action")
+    # Сообщение, начинающееся с /, считаем отменой — не сохраняем как контент
+    if message.text and message.text.strip().startswith("/"):
+        admin_states.pop(user_id, None)
+        bot.send_message(chat_id, "Отменено. Изменения не сохранены.")
+        _admin_send_menu(chat_id)
+        return
     data = _load_config()
     if action == "welcome_text":
         if message.text is not None:
             data["welcome_text"] = message.text
             _save_config(data)
             admin_states.pop(user_id, None)
-            _admin_send_menu(chat_id, "Приветственный текст сохранён.")
+            bot.send_message(chat_id, "✅ Изменения приняты. Приветствие теперь отображается так:")
+            _admin_send_welcome_preview(chat_id)
+            _admin_send_menu(chat_id)
         return
     if action == "welcome_photo":
         if message.photo:
             data["welcome_photo"] = message.photo[-1].file_id
             _save_config(data)
             admin_states.pop(user_id, None)
-            _admin_send_menu(chat_id, "Картинка приветствия сохранена.")
+            bot.send_message(chat_id, "✅ Изменения приняты. Приветствие теперь отображается так:")
+            _admin_send_welcome_preview(chat_id)
+            _admin_send_menu(chat_id)
         return
     if action == "question_text":
         q_index = state.get("question_index", 0)
@@ -549,7 +593,9 @@ def handle_admin_input(message: types.Message) -> None:
             data["questions"][q_index]["text"] = message.text
             _save_config(data)
             admin_states.pop(user_id, None)
-            _admin_send_menu(chat_id, f"Текст вопроса {q_index + 1} сохранён.")
+            bot.send_message(chat_id, f"✅ Изменения приняты. Вопрос {q_index + 1} теперь отображается так:")
+            _admin_send_question_preview(chat_id, q_index)
+            _admin_send_menu(chat_id)
         return
     if action == "question_photo":
         q_index = state.get("question_index", 0)
@@ -559,7 +605,9 @@ def handle_admin_input(message: types.Message) -> None:
             data["questions"][q_index]["photo"] = message.photo[-1].file_id
             _save_config(data)
             admin_states.pop(user_id, None)
-            _admin_send_menu(chat_id, f"Картинка вопроса {q_index + 1} сохранена.")
+            bot.send_message(chat_id, f"✅ Изменения приняты. Вопрос {q_index + 1} теперь отображается так:")
+            _admin_send_question_preview(chat_id, q_index)
+            _admin_send_menu(chat_id)
         return
 
 
@@ -591,20 +639,26 @@ def handle_admin_callback(call: types.CallbackQuery) -> None:
         return
     if parts[1] == "welcome_text":
         admin_states[user_id] = {"action": "welcome_text"}
-        bot.send_message(chat_id, "Отправьте новый текст приветствия (поддерживается Markdown). Для отмены нажмите /admin и выберите пункт снова.")
+        bot.send_message(chat_id, "Текущий вид приветствия (как видят пользователи):")
+        _admin_send_welcome_preview(chat_id)
+        bot.send_message(chat_id, "Отправьте новый текст приветствия (поддерживается Markdown). Для отмены — /admin.")
         return
     if parts[1] == "welcome_photo":
         admin_states[user_id] = {"action": "welcome_photo"}
-        bot.send_message(chat_id, "Отправьте картинку для приветствия.")
+        bot.send_message(chat_id, "Текущий вид приветствия (как видят пользователи):")
+        _admin_send_welcome_preview(chat_id)
+        bot.send_message(chat_id, "Отправьте новую картинку для приветствия.")
         return
     if parts[1] == "welcome_photo_clear":
         data = _load_config()
         data["welcome_photo"] = None
         _save_config(data)
+        bot.send_message(chat_id, "✅ Изменения приняты. Приветствие теперь отображается так:")
+        _admin_send_welcome_preview(chat_id)
         try:
-            bot.edit_message_text("Картинка приветствия убрана. Выберите действие:", chat_id, call.message.message_id, reply_markup=_admin_main_markup())
+            bot.edit_message_text("Админка. Выберите действие:", chat_id, call.message.message_id, reply_markup=_admin_main_markup())
         except Exception:
-            _admin_send_menu(chat_id, "Картинка приветствия убрана.")
+            _admin_send_menu(chat_id)
         return
     if parts[1] == "question_list":
         try:
@@ -616,6 +670,8 @@ def handle_admin_callback(call: types.CallbackQuery) -> None:
         if len(parts) == 3:
             q_index = int(parts[2])
             if 0 <= q_index < len(QUESTIONS):
+                bot.send_message(chat_id, f"Вопрос {q_index + 1}. Текущий вид (как видят пользователи):")
+                _admin_send_question_preview(chat_id, q_index)
                 try:
                     bot.edit_message_text(
                         f"Вопрос {q_index + 1}. Что изменить?",
@@ -631,10 +687,14 @@ def handle_admin_callback(call: types.CallbackQuery) -> None:
             sub = parts[3]
             if sub == "text":
                 admin_states[user_id] = {"action": "question_text", "question_index": q_index}
+                bot.send_message(chat_id, f"Вопрос {q_index + 1}. Текущий вид:")
+                _admin_send_question_preview(chat_id, q_index)
                 bot.send_message(chat_id, f"Отправьте новый текст для вопроса {q_index + 1}.")
                 return
             if sub == "photo":
                 admin_states[user_id] = {"action": "question_photo", "question_index": q_index}
+                bot.send_message(chat_id, f"Вопрос {q_index + 1}. Текущий вид:")
+                _admin_send_question_preview(chat_id, q_index)
                 bot.send_message(chat_id, f"Отправьте картинку для вопроса {q_index + 1}.")
                 return
             if sub == "clear" and 0 <= q_index < len(QUESTIONS):
@@ -643,10 +703,12 @@ def handle_admin_callback(call: types.CallbackQuery) -> None:
                     data.setdefault("questions", []).append({"text": None, "photo": None})
                 data["questions"][q_index]["photo"] = None
                 _save_config(data)
+                bot.send_message(chat_id, f"✅ Изменения приняты. Вопрос {q_index + 1} теперь отображается так:")
+                _admin_send_question_preview(chat_id, q_index)
                 try:
-                    bot.edit_message_text("Картинка вопроса убрана. Выберите действие:", chat_id, call.message.message_id, reply_markup=_admin_main_markup())
+                    bot.edit_message_text("Админка. Выберите действие:", chat_id, call.message.message_id, reply_markup=_admin_main_markup())
                 except Exception:
-                    _admin_send_menu(chat_id, "Картинка вопроса убрана.")
+                    _admin_send_menu(chat_id)
                 return
 
 
@@ -665,7 +727,11 @@ def handle_start(message: types.Message) -> None:
     welcome_text = get_welcome_text()
     photo_file_id = get_welcome_photo()
     if photo_file_id:
-        bot.send_photo(chat_id, photo_file_id, caption=welcome_text, parse_mode="Markdown", reply_markup=markup)
+        if len(welcome_text) <= PHOTO_CAPTION_MAX:
+            bot.send_photo(chat_id, photo_file_id, caption=welcome_text, parse_mode="Markdown", reply_markup=markup)
+        else:
+            bot.send_photo(chat_id, photo_file_id, caption=welcome_text[: PHOTO_CAPTION_MAX - 1] + "…", parse_mode="Markdown")
+            bot.send_message(chat_id, welcome_text, parse_mode="Markdown", reply_markup=markup)
     else:
         bot.send_message(chat_id, welcome_text, parse_mode="Markdown", reply_markup=markup)
 
@@ -676,7 +742,11 @@ def send_question(chat_id: int, q_index: int) -> None:
     markup = build_question_markup(q_index)
     photo_file_id = get_question_photo(q_index)
     if photo_file_id:
-        bot.send_photo(chat_id, photo_file_id, caption=text, reply_markup=markup)
+        if len(text) <= PHOTO_CAPTION_MAX:
+            bot.send_photo(chat_id, photo_file_id, caption=text, reply_markup=markup)
+        else:
+            bot.send_photo(chat_id, photo_file_id, caption=f"Вопрос {q_index + 1} из {len(QUESTIONS)}")
+            bot.send_message(chat_id, display_text, reply_markup=markup)
     else:
         bot.send_message(chat_id, text, reply_markup=markup)
 
