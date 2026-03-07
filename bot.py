@@ -549,7 +549,10 @@ def _admin_send_question_preview(chat_id: int, q_index: int) -> None:
 PHOTO_CAPTION_MAX = 1024
 
 
-@bot.message_handler(func=lambda m: m.from_user and m.from_user.id in admin_states)
+@bot.message_handler(
+    content_types=["text", "photo"],
+    func=lambda m: m.from_user and m.from_user.id in admin_states,
+)
 def handle_admin_input(message: types.Message) -> None:
     user_id = message.from_user.id
     if user_id not in ADMIN_IDS:
