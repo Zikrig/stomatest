@@ -7,3 +7,7 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    # Сохранить config.json между перезапусками (при использовании /admin):
+    # volumes:
+    #   - ./data:/app/data
+    # и в .env: CONFIG_PATH=/app/data/config.json

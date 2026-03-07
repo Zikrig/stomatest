@@ -1,22 +1,28 @@
+import json
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import telebot
 from telebot import types
 
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_CHAT_ID_RAW = os.environ.get("ADMIN_CHAT_ID")
+ADMIN_IDS_RAW = os.environ.get("ADMIN_IDS", "")
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")
 
 if not BOT_TOKEN:
     raise RuntimeError("Environment variable BOT_TOKEN is required")
 
-ADMIN_CHAT_ID: Optional[int]
-try:
-    ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_RAW) if ADMIN_CHAT_ID_RAW else None
-except ValueError:
-    ADMIN_CHAT_ID = None
+ADMIN_IDS: List[int] = []
+for part in ADMIN_IDS_RAW.replace(" ", "").split(","):
+    part = part.strip()
+    if part:
+        try:
+            ADMIN_IDS.append(int(part))
+        except ValueError:
+            pass
 
 
 @dataclass
@@ -308,6 +314,67 @@ QUESTIONS: List[Question] = [
     ),
 ]
 
+DEFAULT_WELCOME_TEXT = (
+    "Это не медицинский диагноз, а **ориентировочная оценка** риска проблем "
+    "полости рта ребёнка.\n\n"
+    "Результаты анкеты не заменяют очный осмотр стоматолога. "
+    "При любых жалобах или сомнениях обязательно запишитесь на приём к врачу."
+)
+
+
+def _config_path() -> Path:
+    return Path(CONFIG_PATH)
+
+
+def _load_config() -> Dict[str, Any]:
+    p = _config_path()
+    if not p.exists():
+        return {"welcome_text": None, "welcome_photo": None, "questions": []}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    if "questions" not in data:
+        data["questions"] = []
+    while len(data["questions"]) < len(QUESTIONS):
+        data["questions"].append({"text": None, "photo": None})
+    return data
+
+
+def _save_config(data: Dict[str, Any]) -> None:
+    p = _config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_welcome_text() -> str:
+    data = _load_config()
+    t = data.get("welcome_text")
+    return t if t else DEFAULT_WELCOME_TEXT
+
+
+def get_welcome_photo() -> Optional[str]:
+    return _load_config().get("welcome_photo")
+
+
+def get_question_display_text(q_index: int) -> str:
+    q = QUESTIONS[q_index]
+    data = _load_config()
+    questions = data.get("questions") or []
+    if q_index < len(questions) and questions[q_index].get("text"):
+        return questions[q_index]["text"]
+    return q.text
+
+
+def get_question_photo(q_index: int) -> Optional[str]:
+    data = _load_config()
+    questions = data.get("questions") or []
+    if q_index < len(questions):
+        return questions[q_index].get("photo")
+    return None
+
 
 class SurveyState:
     def __init__(self) -> None:
@@ -323,13 +390,13 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # Память в процессе: для тестового задания достаточно
 user_states: Dict[int, SurveyState] = {}
 
+# Админ: ожидание ввода (текст или фото)
+# {"action": "welcome_text" | "welcome_photo" | "question_text" | "question_photo", "question_index": int?}
+admin_states: Dict[int, Dict[str, Any]] = {}
 
-DISCLAIMER_TEXT = (
-    "Это не медицинский диагноз, а **ориентировочная оценка** риска проблем "
-    "полости рта ребёнка.\n\n"
-    "Результаты анкеты не заменяют очный осмотр стоматолога. "
-    "При любых жалобах или сомнениях обязательно запишитесь на приём к врачу."
-)
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 def get_or_create_state(user_id: int) -> SurveyState:
@@ -407,6 +474,182 @@ def ask_phone(chat_id: int) -> None:
     )
 
 
+def _admin_main_markup() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("Приветствие: текст", callback_data="admin:welcome_text"))
+    m.add(types.InlineKeyboardButton("Приветствие: картинка", callback_data="admin:welcome_photo"))
+    if get_welcome_photo():
+        m.add(types.InlineKeyboardButton("Приветствие: убрать картинку", callback_data="admin:welcome_photo_clear"))
+    m.add(types.InlineKeyboardButton("Список вопросов (1–25)", callback_data="admin:question_list"))
+    return m
+
+
+def _admin_question_list_markup() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=5)
+    row = []
+    for i in range(len(QUESTIONS)):
+        row.append(types.InlineKeyboardButton(str(i + 1), callback_data=f"admin:q:{i}"))
+        if len(row) == 5:
+            m.add(*row)
+            row = []
+    if row:
+        m.add(*row)
+    m.add(types.InlineKeyboardButton("← В меню", callback_data="admin:menu"))
+    return m
+
+
+def _admin_question_submenu_markup(q_index: int) -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("Изменить текст", callback_data=f"admin:q:{q_index}:text"))
+    m.add(types.InlineKeyboardButton("Изменить картинку", callback_data=f"admin:q:{q_index}:photo"))
+    data = _load_config()
+    questions = data.get("questions") or []
+    if q_index < len(questions) and questions[q_index].get("photo"):
+        m.add(types.InlineKeyboardButton("Убрать картинку", callback_data=f"admin:q:{q_index}:clear"))
+    m.add(types.InlineKeyboardButton("← К списку вопросов", callback_data="admin:question_list"))
+    m.add(types.InlineKeyboardButton("← В меню", callback_data="admin:menu"))
+    return m
+
+
+def _admin_send_menu(chat_id: int, text: str = "Админка. Выберите действие:") -> None:
+    bot.send_message(chat_id, text, reply_markup=_admin_main_markup())
+
+
+@bot.message_handler(func=lambda m: m.from_user and m.from_user.id in admin_states)
+def handle_admin_input(message: types.Message) -> None:
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        admin_states.pop(user_id, None)
+        return
+    state = admin_states.get(user_id)
+    if not state:
+        return
+    chat_id = message.chat.id
+    action = state.get("action")
+    data = _load_config()
+    if action == "welcome_text":
+        if message.text is not None:
+            data["welcome_text"] = message.text
+            _save_config(data)
+            admin_states.pop(user_id, None)
+            _admin_send_menu(chat_id, "Приветственный текст сохранён.")
+        return
+    if action == "welcome_photo":
+        if message.photo:
+            data["welcome_photo"] = message.photo[-1].file_id
+            _save_config(data)
+            admin_states.pop(user_id, None)
+            _admin_send_menu(chat_id, "Картинка приветствия сохранена.")
+        return
+    if action == "question_text":
+        q_index = state.get("question_index", 0)
+        if message.text is not None and 0 <= q_index < len(QUESTIONS):
+            while len(data.get("questions", [])) <= q_index:
+                data.setdefault("questions", []).append({"text": None, "photo": None})
+            data["questions"][q_index]["text"] = message.text
+            _save_config(data)
+            admin_states.pop(user_id, None)
+            _admin_send_menu(chat_id, f"Текст вопроса {q_index + 1} сохранён.")
+        return
+    if action == "question_photo":
+        q_index = state.get("question_index", 0)
+        if message.photo and 0 <= q_index < len(QUESTIONS):
+            while len(data.get("questions", [])) <= q_index:
+                data.setdefault("questions", []).append({"text": None, "photo": None})
+            data["questions"][q_index]["photo"] = message.photo[-1].file_id
+            _save_config(data)
+            admin_states.pop(user_id, None)
+            _admin_send_menu(chat_id, f"Картинка вопроса {q_index + 1} сохранена.")
+        return
+
+
+@bot.message_handler(commands=["admin"])
+def handle_admin_command(message: types.Message) -> None:
+    if not message.from_user:
+        return
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Доступ запрещён.")
+        return
+    _admin_send_menu(message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin:"))
+def handle_admin_callback(call: types.CallbackQuery) -> None:
+    if not call.from_user or not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, text="Доступ запрещён.")
+        return
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    parts = call.data.split(":")
+    bot.answer_callback_query(call.id)
+    if parts[1] == "menu":
+        admin_states.pop(user_id, None)
+        try:
+            bot.edit_message_text("Админка. Выберите действие:", chat_id, call.message.message_id, reply_markup=_admin_main_markup())
+        except Exception:
+            bot.send_message(chat_id, "Админка. Выберите действие:", reply_markup=_admin_main_markup())
+        return
+    if parts[1] == "welcome_text":
+        admin_states[user_id] = {"action": "welcome_text"}
+        bot.send_message(chat_id, "Отправьте новый текст приветствия (поддерживается Markdown). Для отмены нажмите /admin и выберите пункт снова.")
+        return
+    if parts[1] == "welcome_photo":
+        admin_states[user_id] = {"action": "welcome_photo"}
+        bot.send_message(chat_id, "Отправьте картинку для приветствия.")
+        return
+    if parts[1] == "welcome_photo_clear":
+        data = _load_config()
+        data["welcome_photo"] = None
+        _save_config(data)
+        try:
+            bot.edit_message_text("Картинка приветствия убрана. Выберите действие:", chat_id, call.message.message_id, reply_markup=_admin_main_markup())
+        except Exception:
+            _admin_send_menu(chat_id, "Картинка приветствия убрана.")
+        return
+    if parts[1] == "question_list":
+        try:
+            bot.edit_message_text("Выберите номер вопроса (1–25):", chat_id, call.message.message_id, reply_markup=_admin_question_list_markup())
+        except Exception:
+            bot.send_message(chat_id, "Выберите номер вопроса (1–25):", reply_markup=_admin_question_list_markup())
+        return
+    if parts[1] == "q":
+        if len(parts) == 3:
+            q_index = int(parts[2])
+            if 0 <= q_index < len(QUESTIONS):
+                try:
+                    bot.edit_message_text(
+                        f"Вопрос {q_index + 1}. Что изменить?",
+                        chat_id,
+                        call.message.message_id,
+                        reply_markup=_admin_question_submenu_markup(q_index),
+                    )
+                except Exception:
+                    bot.send_message(chat_id, f"Вопрос {q_index + 1}. Что изменить?", reply_markup=_admin_question_submenu_markup(q_index))
+            return
+        if len(parts) == 4:
+            q_index = int(parts[2])
+            sub = parts[3]
+            if sub == "text":
+                admin_states[user_id] = {"action": "question_text", "question_index": q_index}
+                bot.send_message(chat_id, f"Отправьте новый текст для вопроса {q_index + 1}.")
+                return
+            if sub == "photo":
+                admin_states[user_id] = {"action": "question_photo", "question_index": q_index}
+                bot.send_message(chat_id, f"Отправьте картинку для вопроса {q_index + 1}.")
+                return
+            if sub == "clear" and 0 <= q_index < len(QUESTIONS):
+                data = _load_config()
+                while len(data.get("questions", [])) <= q_index:
+                    data.setdefault("questions", []).append({"text": None, "photo": None})
+                data["questions"][q_index]["photo"] = None
+                _save_config(data)
+                try:
+                    bot.edit_message_text("Картинка вопроса убрана. Выберите действие:", chat_id, call.message.message_id, reply_markup=_admin_main_markup())
+                except Exception:
+                    _admin_send_menu(chat_id, "Картинка вопроса убрана.")
+                return
+
+
 @bot.message_handler(commands=["start"])
 def handle_start(message: types.Message) -> None:
     chat_id = message.chat.id
@@ -419,14 +662,23 @@ def handle_start(message: types.Message) -> None:
 
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Согласен, начать", callback_data="start_survey"))
-    bot.send_message(chat_id, DISCLAIMER_TEXT, parse_mode="Markdown", reply_markup=markup)
+    welcome_text = get_welcome_text()
+    photo_file_id = get_welcome_photo()
+    if photo_file_id:
+        bot.send_photo(chat_id, photo_file_id, caption=welcome_text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        bot.send_message(chat_id, welcome_text, parse_mode="Markdown", reply_markup=markup)
 
 
 def send_question(chat_id: int, q_index: int) -> None:
-    q = QUESTIONS[q_index]
-    text = f"Вопрос {q_index + 1} из {len(QUESTIONS)}\n\n{q.text}"
+    display_text = get_question_display_text(q_index)
+    text = f"Вопрос {q_index + 1} из {len(QUESTIONS)}\n\n{display_text}"
     markup = build_question_markup(q_index)
-    bot.send_message(chat_id, text, reply_markup=markup)
+    photo_file_id = get_question_photo(q_index)
+    if photo_file_id:
+        bot.send_photo(chat_id, photo_file_id, caption=text, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "start_survey")
@@ -504,7 +756,7 @@ def handle_contact(message: types.Message) -> None:
 
     bot.send_message(chat_id, "Спасибо! Мы получили ваш номер телефона.", reply_markup=types.ReplyKeyboardRemove())
 
-    if ADMIN_CHAT_ID:
+    if ADMIN_IDS:
         text_lines = [
             "Новый контакт от пользователя анкеты:",
             f"Имя: {contact.first_name or ''} {contact.last_name or ''}".strip(),
@@ -514,7 +766,11 @@ def handle_contact(message: types.Message) -> None:
             f"Статус: {state.result_status or score_to_status(state.total_score)}",
         ]
         text = "\n".join(line for line in text_lines if line)
-        bot.send_message(ADMIN_CHAT_ID, text)
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(admin_id, text)
+            except Exception:
+                pass
 
 
 @bot.message_handler(func=lambda m: m.text == "Не оставлять телефон")
